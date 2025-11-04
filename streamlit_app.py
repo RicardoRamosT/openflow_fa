@@ -1,12 +1,70 @@
 # streamlit_app.py — OpenFlow Data + Docs (no server-side filtering)
-
+import os
 import json
 import datetime as dt
 import pandas as pd
 import streamlit as st
-
+import base64
+from snowflake.snowpark import Session
 from snowflake.snowpark.context import get_active_session
-session = get_active_session()
+from snowflake.connector.errors import ProgrammingError
+from cryptography.hazmat.primitives import serialization
+
+# ---------------------------- SESSION SETUP ----------------------------
+st.set_page_config(page_title="OpenFlow Data + Docs", layout="wide")
+st.title("OpenFlow Data + Docs")
+
+# Try to use existing Snowflake session (works only inside Snowflake)
+try:
+    session = get_active_session()
+    st.success("Connected using Snowflake native session.")
+except Exception:
+    st.warning("No active Snowflake session detected — creating one manually...")
+
+    # Load connection info (from Streamlit secrets or environment vars)
+    CONNECTION_PARAMETERS = {
+        "account": os.getenv("SNOWFLAKE_ACCOUNT", st.secrets.get("SNOWFLAKE_ACCOUNT", "")),
+        "user": os.getenv("SNOWFLAKE_USER", st.secrets.get("SNOWFLAKE_USER", "")),
+        "role": os.getenv("SNOWFLAKE_ROLE", st.secrets.get("SNOWFLAKE_ROLE", "")),
+        "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE", st.secrets.get("SNOWFLAKE_WAREHOUSE", "")),
+        "database": os.getenv("SNOWFLAKE_DATABASE", st.secrets.get("SNOWFLAKE_DATABASE", "")),
+        "schema": os.getenv("SNOWFLAKE_SCHEMA", st.secrets.get("SNOWFLAKE_SCHEMA", "")),
+        "private_key_file": os.getenv("SNOWFLAKE_PRIVATE_KEY_FILE", st.secrets.get("SNOWFLAKE_PRIVATE_KEY_FILE", "rsa_key.p8")),
+        "private_key_passphrase": os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", st.secrets.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "")),
+    }
+
+    # Load private key
+    try:
+        with open(CONNECTION_PARAMETERS["private_key_file"], "rb") as key_file:
+            p_key = serialization.load_pem_private_key(
+                key_file.read(),
+                password=CONNECTION_PARAMETERS["private_key_passphrase"].encode()
+                if CONNECTION_PARAMETERS["private_key_passphrase"] else None,
+            )
+        pkb = p_key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+
+        connection = {
+            "account": CONNECTION_PARAMETERS["account"],
+            "user": CONNECTION_PARAMETERS["user"],
+            "role": CONNECTION_PARAMETERS["role"],
+            "warehouse": CONNECTION_PARAMETERS["warehouse"],
+            "database": CONNECTION_PARAMETERS["database"],
+            "schema": CONNECTION_PARAMETERS["schema"],
+            "private_key": pkb,
+        }
+
+        session = Session.builder.configs(connection).create()
+        st.success("✅ Connected to Snowflake via key-pair authentication.")
+    except FileNotFoundError:
+        st.error("❌ Private key file not found. Make sure rsa_key.p8 is uploaded.")
+    except ProgrammingError as e:
+        st.error(f"❌ Failed to connect to Snowflake: {e}")
+    except Exception as e:
+        st.error(f"❌ Unexpected error while creating session: {e}")
 
 # ---------------------------- CONFIG ----------------------------
 DB = "ANALYTICS_FA"
@@ -15,9 +73,6 @@ SEARCH_SERVICE = "ANALYTICS_FA.RAW.DOCS_SEARCH_FA"   # Cortex Search service nam
 DOCS_STAGE = "RAW_DOCS_STAGE"                        # stage for file preview
 PREVIEW_SECONDS = 3600                               # presigned URL validity
 PREVIEW_LIMIT = 100                                  # row preview cap
-
-st.set_page_config(page_title="OpenFlow Data + Docs", layout="wide")
-st.title("OpenFlow Data + Docs")
 
 # ---------------------------- BASIC HELPERS ---------------------
 def sql_to_df(sql: str, params=None) -> pd.DataFrame:
@@ -47,9 +102,7 @@ def parse_variant_json(v):
         return {"raw": str(v)}
 
 def get_presigned_url(path: str, seconds: int = PREVIEW_SECONDS) -> str | None:
-    """
-    Generate a presigned URL for a file stored in a stage.
-    """
+    """Generate a presigned URL for a file stored in a stage."""
     try:
         sql = f"SELECT GET_PRESIGNED_URL('@{DOCS_STAGE}', ?, ?) AS URL"
         url = sql_scalar(sql, params=[path, seconds])
@@ -69,16 +122,12 @@ def _extract_hit(hit: dict) -> dict:
         "PERSON":        row.get("PERSON"),
         "DOC_TYPE":      row.get("DOC_TYPE"),
         "DOC_DATE":      row.get("DOC_DATE"),
-        # Optional if the service returns them; otherwise None
         "score_sem":     scores.get("cosine_similarity"),
         "score_text":    scores.get("text_match"),
     }
 
 def run_search(query: str, limit: int, service_name: str) -> list[dict]:
-    """
-    Call SEARCH_PREVIEW with a safe column list (no @scores requirement).
-    If scores are present, we still surface them.
-    """
+    """Call SEARCH_PREVIEW with a safe column list."""
     payload = {
         "query": query,
         "limit": int(limit),
@@ -115,10 +164,7 @@ def filter_hits_locally(rows, person=None, doc_type=None, d_from=None, d_to=None
 
 # ---------------------------- AGENT HELPER ----------------------
 def agent_answer(prompt: str) -> str:
-    """
-    Calls your FA_DOCS_AGENT via the Cortex function and returns text.
-    This will gracefully return the error text if the function isn't available.
-    """
+    """Calls your FA_DOCS_AGENT via the Cortex function and returns text."""
     try:
         sql = "SELECT SNOWFLAKE.CORTEX.EXECUTE_AGENT(?, OBJECT_CONSTRUCT('input', ?)) AS R"
         res = session.sql(sql, params=["FA_DOCS_AGENT", prompt]).collect()
@@ -162,7 +208,7 @@ with tab1:
     st.subheader("Preview a table")
     tbl = st.selectbox(
         "Pick a table",
-        options=tables_df["TABLE_NAME"].tolist(),
+        options=tables_df["TABLE_NAME"].tolist() if not tables_df.empty else [],
         index=0 if not tables_df.empty else None,
         key="tbl_pick",
     )
@@ -175,7 +221,6 @@ with tab1:
 with tab2:
     st.subheader("Semantic search over uploaded documents")
 
-    # --- Filters (client-side only) ---
     with st.container(border=True):
         q = st.text_input("Query", placeholder="e.g., remote work policy, onboarding, invoice total …", key="q_text")
 
@@ -206,14 +251,12 @@ with tab2:
         if not q or not q.strip():
             st.warning("Enter a search query first.")
         else:
-            # normalize filters to None when (any) or empty
             p = None if person_sel in (None, "", "(any)") else person_sel
             t = None if dtype_sel  in (None, "", "(any)") else dtype_sel
             d1 = d_from if isinstance(d_from, dt.date) else None
             d2 = d_to   if isinstance(d_to,   dt.date) else None
 
             try:
-                # Always client-side: SEARCH_PREVIEW + local filters
                 rows = run_search(q.strip(), int(limit), SEARCH_SERVICE)
                 rows = filter_hits_locally(rows, person=p, doc_type=t, d_from=d1, d_to=d2)
                 hits_df = pd.DataFrame(rows)
@@ -228,23 +271,10 @@ with tab2:
                 hits_df = hits_df[[c for c in cols if c in hits_df.columns]]
                 st.dataframe(hits_df, use_container_width=True, height=350)
 
-                st.caption("Preview (requires files in a stage you can presign).")
-                if "RELATIVE_PATH" in hits_df and not hits_df["RELATIVE_PATH"].isna().all():
-                    sel = st.selectbox(
-                        "Pick a path to preview",
-                        hits_df["RELATIVE_PATH"].dropna().unique(),
-                        key="preview_path",
-                    )
-                    if sel:
-                        # url = get_presigned_url(sel, PREVIEW_SECONDS)
-                        # if url:
-                        #     st.components.v1.iframe(url, height=600, scrolling=True)
-                        pass
-
 # =========================== TAB 3 ==============================
 with tab3:
     st.subheader("Chat with Agent")
-    st.caption("Using agent:  **FA_DOCS_AGENT**.  Tip: ask for tables, e.g., “count by doc_type last 12 months”.")
+    st.caption("Using agent: **FA_DOCS_AGENT**. Tip: ask for tables, e.g., “count by doc_type last 12 months”.")
 
     user_q = st.text_area(
         "Your question",
